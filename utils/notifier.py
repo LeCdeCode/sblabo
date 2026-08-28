@@ -1,76 +1,50 @@
+"""Gestion des notifications et envoi de messages."""
 from utils.logger import log
+import asyncio
 
-WEBHOOK_CACHE = {}
 
-async def get_or_create_webhook(session, channel_id, headers, base_url):
-    """Récupère ou crée un webhook pour un salon"""
-    if channel_id in WEBHOOK_CACHE:
-        return WEBHOOK_CACHE[channel_id]
-
-    url = f"{base_url}/channels/{channel_id}/webhooks"
-    try:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status == 200:
-                webhooks = await resp.json()
-                for wh in webhooks:
-                    if wh.get("type") == 1:
-                        WEBHOOK_CACHE[channel_id] = wh["id"], wh["token"]
-                        return wh["id"], wh["token"]
-
-        # Si aucun webhook existant, on en crée un
-        payload = {"name": "LabNotifier"}
-        async with session.post(url, headers=headers, json=payload) as resp:
-            if resp.status in [200, 201]:
-                wh = await resp.json()
-                WEBHOOK_CACHE[channel_id] = wh["id"], wh["token"]
-                return wh["id"], wh["token"]
-            else:
-                body = await resp.text()
-                log("ERROR", f"Échec création Webhook ({resp.status}): {body}")
-    except Exception as e:
-        log("ERROR", f"Exception get_or_create_webhook: {e}")
-
-    return None, None
-
-async def send_response(session, channel_id, user_data, content, embed=None, headers=None, base_url=None):
-    """Envoie une réponse via webhook ou message standard"""
+async def send_response(session, channel_id, user_data, content="", embed=None, headers=None, base_url=None):
+    """Envoie une réponse directe via message (pas de webhook pour éviter erreurs permission).
+    
+    Args:
+        session: Session aiohttp
+        channel_id (str): ID du salon cible
+        user_data (dict): Données utilisateur
+        content (str): Contenu du message
+        embed (dict): Données d'embed (optionnel)
+        headers (dict): Headers personnalisés (optionnel)
+        base_url (str): URL de base (optionnel)
+    
+    Returns:
+        bool: True si envoi réussi, False sinon
+    """
     from config import HEADERS as DEFAULT_HEADERS, BASE_URL as DEFAULT_BASE_URL
+    
     headers = headers or DEFAULT_HEADERS
     base_url = base_url or DEFAULT_BASE_URL
 
-    wh_id, wh_token = await get_or_create_webhook(session, channel_id, headers, base_url)
-    
-    payload = {
-        "content": content,
-        "username": user_data.get("username", "LabSystem"),
-        "avatar_url": f"https://cdn.discordapp.com/avatars/{user_data.get('id')}/{user_data.get('avatar')}.png" if user_data.get("avatar") else None
-    }
-    if embed:
-        payload["embeds"] = [embed]
-
-    if wh_id and wh_token:
-        wh_url = f"{base_url}/webhooks/{wh_id}/{wh_token}"
-        try:
-            async with session.post(wh_url, json=payload) as resp:
-                if resp.status in [200, 204]:
-                    return True
-                log("WARN", f"Webhook d'envoi refusé ({resp.status}), fallback REST direct.")
-        except Exception as e:
-            log("ERROR", f"Erreur envoi Webhook: {e}")
-
-    # Fallback message standard si webhook échoue
-    msg_url = f"{base_url}/channels/{channel_id}/messages"
-    msg_payload = {"content": content}
+    # Prépare le payload du message
+    msg_payload = {}
+    if content:
+        msg_payload["content"] = content
     if embed:
         msg_payload["embeds"] = [embed]
 
+    # Utilise l'API REST directe (plus fiable que webhook)
+    msg_url = f"{base_url}/channels/{channel_id}/messages"
+    
     try:
-        async with session.post(msg_url, headers=headers, json=msg_payload) as resp:
+        async with session.post(msg_url, headers=headers, json=msg_payload, timeout=10) as resp:
             if resp.status in [200, 201]:
+                log("SUCCESS", f"Message envoyé au salon {channel_id}")
                 return True
-            body = await resp.text()
-            log("ERROR", f"Échec envoi message REST ({resp.status}): {body}")
+            else:
+                body = await resp.text()
+                log("WARN", f"Échec envoi message REST ({resp.status}): {body[:150]}")
+                return False
+    except asyncio.TimeoutError:
+        log("WARN", f"Timeout send_response pour channel {channel_id}")
+        return False
     except Exception as e:
-        log("ERROR", f"Exception send_response REST: {e}")
-
-    return False
+        log("ERROR", f"Exception send_response: {type(e).__name__}: {e}")
+        return False
