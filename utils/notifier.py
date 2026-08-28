@@ -1,12 +1,9 @@
-import datetime
+from utils.logger import log
 
 WEBHOOK_CACHE = {}
 
-def log(level, message):
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{now}] [{level}] {message}")
-
 async def get_or_create_webhook(session, channel_id, headers, base_url):
+    """Récupère ou crée un webhook pour un salon"""
     if channel_id in WEBHOOK_CACHE:
         return WEBHOOK_CACHE[channel_id]
 
@@ -36,6 +33,7 @@ async def get_or_create_webhook(session, channel_id, headers, base_url):
     return None, None
 
 async def send_response(session, channel_id, user_data, content, embed=None, headers=None, base_url=None):
+    """Envoie une réponse via webhook ou message standard"""
     from config import HEADERS as DEFAULT_HEADERS, BASE_URL as DEFAULT_BASE_URL
     headers = headers or DEFAULT_HEADERS
     base_url = base_url or DEFAULT_BASE_URL
