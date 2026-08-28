@@ -7,7 +7,8 @@ import websockets
 import aiohttp
 
 from config import TOKEN, HEADERS, BASE_URL
-from utils.notifier import send_response, log
+from utils.logger import log
+from utils.notifier import send_response
 from utils.interaction_helper import trigger_button
 from utils.jail_helper import extract_prisoner_ids, process_jail_pings
 
@@ -21,6 +22,7 @@ CHANNEL_JAIL = "1465573805450723453"
 BOT_UHQ_ID = "1418944648432586862"
 
 MAX_CLICKED_CACHE = 3000
+
 
 class LabClient:
     def __init__(self):
@@ -58,24 +60,33 @@ class LabClient:
             log("ERROR", f"Erreur sauvegarde config: {e}")
 
     def create_managed_task(self, coro):
+        """Crée une tâche asynchrone gérée avec tracking d'erreurs."""
         task = asyncio.create_task(coro)
         self.background_tasks.add(task)
         task.add_done_callback(self._on_task_complete)
         return task
 
     def _on_task_complete(self, task):
+        """Callback pour nettoyer et tracker les tâches complétées."""
         self.background_tasks.discard(task)
-        if not task.cancelled() and task.exception():
-            log("ERROR", f"Tâche asynchrone non interceptée: {task.exception()}")
+        if not task.cancelled():
+            exc = task.exception()
+            if exc:
+                log("ERROR", f"Tâche asynchrone non interceptée: {type(exc).__name__}: {exc}")
 
     def track_clicked_message(self, msg_id):
+        """Track un message cliqué avec limite de cache."""
         self.clicked_messages.add(msg_id)
         if len(self.clicked_messages) > MAX_CLICKED_CACHE:
-            discard_count = len(self.clicked_messages) - MAX_CLICKED_CACHE
-            for _ in range(discard_count):
-                self.clicked_messages.pop()
+            # Supprime les 500 plus anciennes entrées
+            for _ in range(500):
+                try:
+                    self.clicked_messages.pop()
+                except KeyError:
+                    break
 
     def is_ws_open(self):
+        """Vérifie si la connexion WebSocket est ouverte."""
         if not self.ws:
             return False
         if hasattr(self.ws, 'closed'):
@@ -83,6 +94,7 @@ class LabClient:
         return self.ws.close_code is None
 
     async def send_heartbeat(self):
+        """Envoie les heartbeats au Gateway."""
         while True:
             try:
                 await asyncio.sleep(self.heartbeat_interval)
@@ -99,12 +111,14 @@ class LabClient:
                 else:
                     break
             except asyncio.CancelledError:
+                log("DEBUG", "Heartbeat task cancelled")
                 break
             except Exception as e:
-                log("ERROR", f"Erreur Heartbeat: {e}")
+                log("ERROR", f"Erreur Heartbeat: {type(e).__name__}: {e}")
                 break
 
     def extract_buttons(self, components):
+        """Extrait les boutons des composants d'un message."""
         buttons = []
         if not isinstance(components, list):
             return buttons
@@ -117,6 +131,7 @@ class LabClient:
         return buttons
 
     async def handle_gav_click(self, data, btn, target_guild, msg_id):
+        """Gère le clic du bouton GAV avec gestion des erreurs."""
         log("INFO", f"⏳ [GAV EXECUTION] Envoi de l'interaction bouton sur Msg {msg_id}...")
         success = await trigger_button(self.session, data, btn, self.session_id, target_guild)
         if success:
@@ -126,6 +141,7 @@ class LabClient:
             log("WARN", f"❌ [GAV ERROR] Échec de l'interaction HTTP sur le GAV.")
 
     async def process_gav_snipe(self, data):
+        """Traite le snipe des boutons GAV."""
         msg_id = data.get("id")
         if not msg_id or msg_id in self.clicked_messages:
             return
@@ -145,6 +161,7 @@ class LabClient:
                 return
 
     async def handle_claim_flow(self, data, btn, target_guild, channel_id):
+        """Gère le flux complet du claim."""
         click_success = await trigger_button(self.session, data, btn, self.session_id, target_guild)
         if click_success:
             human_delay = random.uniform(1.2, 2.5)
@@ -153,21 +170,27 @@ class LabClient:
             await self.send_welcome_message(channel_id)
 
     async def send_welcome_message(self, channel_id):
+        """Envoie un message d'accueil après claim."""
         msg = random.choice([
-            "ouais dis moi", "salut, je t’ecoute", "salut, dis moi tout",
-            "yo, dis moi,", "ça va? comment je peux t’aider", "yo, dis moi ce qu'il y’a"
+            "ouais dis moi", "salut, je t'ecoute", "salut, dis moi tout",
+            "yo, dis moi,", "ça va? comment je peux t'aider", "yo, dis moi ce qu'il y'a"
         ])
         url = f"{BASE_URL}/channels/{channel_id}/messages"
         payload = {"content": msg}
         try:
-            async with self.session.post(url, headers=HEADERS, json=payload) as resp:
+            async with self.session.post(url, headers=HEADERS, json=payload, timeout=10) as resp:
                 if resp.status not in [200, 201]:
                     body = await resp.text()
-                    log("WARN", f"Échec send_welcome_message ({resp.status}): {body}")
+                    log("WARN", f"Échec send_welcome_message ({resp.status}): {body[:150]}")
+                else:
+                    log("SUCCESS", "Message d'accueil envoyé")
+        except asyncio.TimeoutError:
+            log("WARN", f"Timeout send_welcome_message pour {channel_id}")
         except Exception as e:
-            log("ERROR", f"Exception send_welcome_message: {e}")
+            log("ERROR", f"Exception send_welcome_message: {type(e).__name__}: {e}")
 
     async def handle_jail_automation(self, data):
+        """Gère l'automatisation des pings jail (Auto-Ping)."""
         if not self.config.get("ap"):
             return
 
@@ -176,16 +199,21 @@ class LabClient:
         author_id = str(author_data.get("id", ""))
         is_bot = author_data.get("bot", False)
 
+        # Filtrage strict du salon
         if channel_id != CHANNEL_JAIL:
+            return
+
+        # Filtrage strict du bot UHQ
+        if author_id != BOT_UHQ_ID and not is_bot:
             return
 
         embeds = data.get("embeds", [])
         if not embeds:
             return
 
-        if author_id != BOT_UHQ_ID and not is_bot:
-            return
+        log("DEBUG", f"[AP] Message UHQ détecté dans le salon Jail {channel_id}")
 
+        # Extraction du texte complet
         content = data.get("content", "")
         full_text = content
         for emb in embeds:
@@ -194,12 +222,14 @@ class LabClient:
             for f in emb.get("fields", []):
                 full_text += " " + str(f.get("name", "")) + " " + str(f.get("value", ""))
 
+        # Extraction et traitement des IDs
         user_ids = extract_prisoner_ids(full_text)
         if user_ids:
             log("INFO", f"IDs Jail extraits: {user_ids}")
             self.create_managed_task(process_jail_pings(self.session, channel_id, user_ids))
 
     async def process_snipe(self, data):
+        """Traite les snipes (tous les modules)."""
         msg_id = data.get("id")
         channel_id = str(data.get("channel_id", ""))
         guild_id = data.get("guild_id") or GUILD_GAV
@@ -249,6 +279,7 @@ class LabClient:
                     return
 
     async def handle_command(self, data):
+        """Gère les commandes personnalisées."""
         author_id = data.get("author", {}).get("id")
         if author_id != self.user_data.get("id"):
             return
@@ -299,6 +330,7 @@ class LabClient:
                         self.create_managed_task(send_response(self.session, channel_id, self.user_data, f"🛑 Module **{target.upper()}** désactivé."))
 
     async def subscribe_guild_events(self, ws):
+        """S'abonne aux événements du Gateway."""
         subscribe_payload = {
             "op": 37,
             "d": {
@@ -319,6 +351,7 @@ class LabClient:
         log("INFO", f"Abonnement Gateway actif pour le salon GAV ({CHANNEL_GAV}).")
 
     async def start(self):
+        """Démarre le client et maintient la connexion."""
         connector = aiohttp.TCPConnector(
             limit=0,
             ttl_dns_cache=600,
@@ -328,7 +361,8 @@ class LabClient:
         self.session = aiohttp.ClientSession(connector=connector)
         
         try:
-            async with self.session.get(f"{BASE_URL}/users/@me", headers=HEADERS) as resp:
+            # Authentification
+            async with self.session.get(f"{BASE_URL}/users/@me", headers=HEADERS, timeout=10) as resp:
                 if resp.status != 200:
                     log("ERROR", f"Token invalide (Status HTTP {resp.status})")
                     return
@@ -348,15 +382,18 @@ class LabClient:
                         self.ws = ws
                         backoff_delay = 2
 
+                        # Réception du Hello
                         hello = json.loads(await ws.recv())
                         if hello.get("op") == 10:
                             self.heartbeat_interval = hello['d']['heartbeat_interval'] / 1000
                         
+                        # Lancement du heartbeat
                         if self.heartbeat_task:
                             self.heartbeat_task.cancel()
                         self.missed_acks = 0
                         self.heartbeat_task = asyncio.create_task(self.send_heartbeat())
 
+                        # Identification
                         identify = {
                             "op": 2,
                             "d": {
@@ -370,6 +407,7 @@ class LabClient:
                         }
                         await ws.send(json.dumps(identify))
 
+                        # Boucle de réception des événements
                         while True:
                             msg = await ws.recv()
                             event = json.loads(msg)
@@ -403,14 +441,16 @@ class LabClient:
                 except Exception as e:
                     if self.heartbeat_task:
                         self.heartbeat_task.cancel()
-                    log("ERROR", f"Interruption Gateway: {e}. Reconnexion dans {backoff_delay}s...")
+                    log("ERROR", f"Interruption Gateway: {type(e).__name__}: {e}. Reconnexion dans {backoff_delay}s...")
                     await asyncio.sleep(backoff_delay)
                     backoff_delay = min(backoff_delay * 2, max_backoff)
         finally:
+            # Nettoyage
             for task in list(self.background_tasks):
                 task.cancel()
             if self.session and not self.session.closed:
                 await self.session.close()
+
 
 if __name__ == "__main__":
     client = LabClient()
